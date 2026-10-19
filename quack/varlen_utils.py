@@ -17,6 +17,10 @@ class VarlenArguments(NamedTuple):
     mCuSeqlensM: Optional[cute.Tensor] = None
     mCuSeqlensK: Optional[cute.Tensor] = None
     mAIdx: Optional[cute.Tensor] = None
+    # Segmented B: (num_groups, num_segs) int32. A's K axis is num_segs
+    # segments of B's K extent; segment j of group g is multiplied by
+    # B[..., mBIdx[g, j]]. Requires varlen_m (groups on M), excludes varlen_k.
+    mBIdx: Optional[cute.Tensor] = None
 
 
 class VarlenManager:
@@ -25,6 +29,7 @@ class VarlenManager:
         cu_seqlens_m: Optional[cute.Tensor] = None
         cu_seqlens_k: Optional[cute.Tensor] = None
         mAIdx: Optional[cute.Tensor] = None
+        mBIdx: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -33,6 +38,7 @@ class VarlenManager:
                 cu_seqlens_m=args.mCuSeqlensM,
                 cu_seqlens_k=args.mCuSeqlensK,
                 mAIdx=args.mAIdx,
+                mBIdx=args.mBIdx,
             )
 
     def __init__(
@@ -54,6 +60,7 @@ class VarlenManager:
         self.varlen_m = const_expr(params.cu_seqlens_m is not None)
         self.varlen_k = const_expr(params.cu_seqlens_k is not None)
         self.gather_A = const_expr(params.mAIdx is not None)
+        self.seg_B = const_expr(params.mBIdx is not None)
         self._loc = loc
         self._ip = ip
 
@@ -62,6 +69,10 @@ class VarlenManager:
         assert not (args.mCuSeqlensM is not None and args.mCuSeqlensK is not None), (
             "Only support either varlen_m or varlen_k"
         )
+        if args.mBIdx is not None:
+            assert args.mCuSeqlensM is not None, "mBIdx (segmented B) requires varlen_m"
+            assert args.mCuSeqlensK is None, "mBIdx (segmented B) is incompatible with varlen_k"
+            assert cute.rank(args.mBIdx) == 2, "mBIdx must be (num_groups, num_segs)"
         return VarlenManager.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod
@@ -121,6 +132,10 @@ class VarlenManager:
         else:
             mAIdx_mk = params.mAIdx[None, batch_idx]
         return mAIdx_mk
+
+    def seg_batches(self, batch_idx: Int32) -> cute.Tensor:
+        """Segment -> B batch ids of group ``batch_idx``: ``mBIdx[batch_idx, :]``."""
+        return self.params.mBIdx[batch_idx, None]
 
     def offset_batch_B(self, mB_nkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
         params = self.params

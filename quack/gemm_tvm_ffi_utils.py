@@ -87,17 +87,18 @@ def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym):
     )
 
 
-def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx):
+def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, B_idx=None):
     if cu_seqlens_m is None and cu_seqlens_k is None:
         return None
     return VarlenArguments(
         mCuSeqlensM=cu_seqlens_m,
         mCuSeqlensK=cu_seqlens_k,
         mAIdx=A_idx,
+        mBIdx=B_idx,
     )
 
 
-def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len):
+def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len, seg_B=False):
     if not varlen_m and not varlen_k:
         return None
     num_seqlens = cute.sym_int()
@@ -110,6 +111,12 @@ def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len):
         ),
         mAIdx=(
             fake_tensor(Int32, (aidx_len,), leading_dim=0, divisibility=4) if gather_A else None
+        ),
+        # (num_groups, num_segs): both extents get their own sym_int
+        mBIdx=(
+            fake_tensor(Int32, (cute.sym_int(), cute.sym_int()), leading_dim=1, divisibility=1)
+            if seg_B
+            else None
         ),
     )
 
@@ -126,6 +133,8 @@ def make_fake_gemm_tensors(
     varlen_m=False,
     varlen_k=False,
     gather_A=False,
+    # segmented B: A's K is num_segs * B's K, so the two need separate sym_ints
+    seg_B=False,
 ):
     """Create fake tensors for mA, mB, mD, mC with shared sym_ints.
     Pass dtype=None to get None for that tensor (e.g. optional C).
@@ -146,7 +155,8 @@ def make_fake_gemm_tensors(
         m = cute.sym_int()
         a_m = cute.sym_int() if gather_A else m
         mA = fake_tensor(a_dtype, (a_m, k), leading_dim=a_leading, divisibility=div_a)
-        mB = fake_tensor(b_dtype, (n, k, l), leading_dim=b_leading, divisibility=div_b)
+        b_k = cute.sym_int() if seg_B else k
+        mB = fake_tensor(b_dtype, (n, b_k, l), leading_dim=b_leading, divisibility=div_b)
         mD = fake_tensor(d_dtype, (m, n), leading_dim=d_leading, divisibility=div_d)
         mC = fake_tensor(c_dtype, (m, n), leading_dim=c_leading, divisibility=div_c)
     elif varlen_k:

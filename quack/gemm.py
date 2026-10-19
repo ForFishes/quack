@@ -55,6 +55,8 @@ def _compile_gemm(
     device_capacity,
     rounding_mode,
     sr_seed_mode,
+    # segmented B changes the load warp and the B k sym_int: part of the jit key
+    seg_B=False,
 ):
     GemmCls = GemmDefaultSm100 if device_capacity[0] > 9 else GemmDefaultSm90
     mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
@@ -69,6 +71,7 @@ def _compile_gemm(
         varlen_m=varlen_m,
         varlen_k=varlen_k,
         gather_A=gather_A,
+        seg_B=seg_B,
     )
 
     def fake_scalar(mode, dtype=Float32):
@@ -100,7 +103,7 @@ def _compile_gemm(
         (is_dynamic_persistent and device_capacity[0] == 9), has_batch_idx_permute, l
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
-    varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
+    varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len, seg_B)
     return compile_gemm_kernel(
         GemmCls,
         a_dtype,
@@ -147,6 +150,12 @@ def gemm(
     add_to_output: bool = False,
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
+    # Segmented B: with B_idx (num_groups, num_segs) int32, A's K axis is read
+    # as num_segs segments of B's K, and segment j of group g is multiplied by
+    # B[B_idx[g, j]].  out[g] = sum_j A_gj @ B[B_idx[g, j]]^T; the concatenated
+    # B is never materialised (the B batch is chosen per K segment in the B TMA
+    # coordinate).
+    B_idx: Optional[Tensor] = None,
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -166,9 +175,27 @@ def gemm(
     if varlen_k:
         assert A.stride(-2) == 1, "varlen_k requires A to be m-major"
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
+    seg_B = B_idx is not None
+    if seg_B:
+        assert varlen_m, "B_idx (segmented B) requires varlen_m"
+        assert not varlen_k, "B_idx (segmented B) is incompatible with varlen_k"
+        assert not gather_A, "B_idx (segmented B) + gather_A not implemented"
+        assert B.ndim == 3, f"segmented B must be (l, n, k), got ndim {B.ndim}"
+        assert B_idx.ndim == 2 and B_idx.stride(-1) == 1, "B_idx must be a contiguous (num_groups, num_segs)"
+        assert B_idx.shape[0] == cu_seqlens_m.shape[0] - 1, (
+            f"B_idx has {B_idx.shape[0]} rows, cu_seqlens_m describes {cu_seqlens_m.shape[0] - 1} groups"
+        )
+        assert A.shape[-1] == B_idx.shape[1] * B.shape[-1], (
+            f"A's k ({A.shape[-1]}) must be B_idx.shape[1] ({B_idx.shape[1]}) segments of B's k ({B.shape[-1]})"
+        )
+        # a segment must be whole k-tiles (cta tile K = 64 for 16-bit, 128 for 8-bit inputs)
+        seg_k_div = 64 if A.element_size() == 2 else 128
+        assert B.shape[-1] % seg_k_div == 0, f"segmented B needs B's k divisible by {seg_k_div}, got {B.shape[-1]}"
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10, 11], "Only SM90, SM100, and SM110 are supported"
+    # the SM90 mainloop does not read B_idx: refuse instead of computing a wrong result
+    assert not seg_B or device_capacity[0] >= 10, "B_idx (segmented B) requires SM100+"
     if rounding_mode == RoundingMode.RS:
         assert (
             device_capacity[0] >= 10
@@ -216,6 +243,7 @@ def gemm(
         device_capacity,
         rounding_mode,
         sr_seed_mode,
+        seg_B,
     )
 
     from quack.cache_utils import COMPILE_ONLY
@@ -248,7 +276,7 @@ def gemm(
         tile_count_semaphore,
         batch_idx_permute,
     )
-    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
+    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, B_idx)
 
     if device_capacity[0] > 9:
         compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
