@@ -128,6 +128,8 @@ def gemm_tuned(
     config: Optional[GemmConfig] = None,
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
+    # segmented B, see quack.gemm.gemm: (num_groups, num_segs) int32 B batch ids
+    B_idx: Optional[Tensor] = None,
 ) -> None:
     if config is None:
         # Use nvMMH heuristic for pure GEMM (no varlen, no gather, no epilogue)
@@ -153,6 +155,9 @@ def gemm_tuned(
         assert config.cluster_n == 1, "gather_A requires cluster_n=1"
     if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
+    if B_idx is not None:
+        assert varlen_m, "B_idx (segmented B) requires cu_seqlens_m"
+        assert not config.swap_ab, "B_idx (segmented B) is incompatible with swap_ab"
     if A.ndim == 2 and not varlen:
         A = A.unsqueeze(0)  # (1, M, K)
     B = B.mT  # (N, K) or (L, N, K) or (N, total_K)
@@ -203,6 +208,7 @@ def gemm_tuned(
         add_to_output=add_to_output,
         rounding_mode=rounding_mode,
         sr_seed=sr_seed,
+        B_idx=B_idx,
     )
 
 
@@ -360,6 +366,11 @@ def gemm(
     tuned: bool = True,
     rounding_mode: int = RoundingMode.RN,
     sr_seed: int | Tensor = 0,
+    # Explicit config and/or segmented B (appended last, so existing calls keep
+    # their meaning).  Neither fits the fixed schema of the `quack::gemm_out`
+    # custom op, so supplying either calls the undecorated `gemm_tuned.fn`.
+    config: Optional[GemmConfig] = None,
+    B_idx: Optional[Tensor] = None,  # (num_groups, num_segs) int32
 ) -> Tensor:
     """GEMM with optional output tensor and tuning control."""
     if out is None:
@@ -378,6 +389,15 @@ def gemm(
                 (A.shape[0], B.shape[-1]) if A.ndim == 2 else (A.shape[0], A.shape[-2], B.shape[-1])
             )
         out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
+    if config is not None or B_idx is not None:
+        assert not tuned, "explicit `config=` / `B_idx=` require tuned=False"
+        gemm_tuned.fn(
+            A, B, out, C=C, bias=bias, alpha=alpha, beta=beta,
+            cu_seqlens_m=cu_seqlens_m, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx,
+            batch_idx_permute=batch_idx_permute, dynamic_scheduler=dynamic_scheduler,
+            config=config, rounding_mode=rounding_mode, sr_seed=sr_seed, B_idx=B_idx,
+        )
+        return out
     alpha_tensor = alpha if not isinstance(alpha, float) else None
     alpha = alpha if isinstance(alpha, float) else 1.0
     sr_seed_tensor = sr_seed if isinstance(sr_seed, Tensor) else None

@@ -771,6 +771,11 @@ class GemmSm100(GemmSm90):
         assert not (varlen_m and varlen_k)
         if const_expr(self.gather_A):
             assert varlen_m or varlen_k
+        if const_expr(varlen_params.mBIdx is not None):
+            # segmented B is wired into the plain (non-gather_A) load path only
+            assert varlen_m and not varlen_k, "segmented B requires varlen_m"
+            assert not self.gather_A, "segmented B + gather_A not implemented"
+            assert not self.blockscaled, "segmented B + blockscaled not implemented"
         has_D = const_expr(mD_mnl is not None)
         has_C = const_expr(mC_mnl is not None)
 
@@ -966,12 +971,15 @@ class GemmSm100(GemmSm90):
                         cute.select(self.mma_tiler, [0, 2]),
                         (mma_tile_coord_mnl[0], None),
                     )
-                # (bN, bK, RestK)
-                gB_nk = cute.local_tile(
-                    varlen_manager.offset_batch_B(mB_nkl, batch_idx),
-                    cute.select(self.mma_tiler, [1, 2]),
-                    (mma_tile_coord_mnl[1], None),
-                )
+                # (bN, bK, RestK). With a segmented B the B batch changes per K
+                # segment, so B is tiled inside `make_copy_B` below instead.
+                gB_nk = None
+                if const_expr(not varlen_manager.seg_B):
+                    gB_nk = cute.local_tile(
+                        varlen_manager.offset_batch_B(mB_nkl, batch_idx),
+                        cute.select(self.mma_tiler, [1, 2]),
+                        (mma_tile_coord_mnl[1], None),
+                    )
                 if const_expr(self.blockscaled):
                     # (bM, bK)
                     gSFA_mkl = cute.local_tile(
@@ -1006,23 +1014,46 @@ class GemmSm100(GemmSm90):
                         mcast_mask=a_mcast_mask,
                     )
                 # (MMA, MMA_N, MMA_K, RestK)
-                tCgB = thr_mma.partition_B(gB_nk)
+                tCgB = None
+                if const_expr(not varlen_manager.seg_B):
+                    tCgB = thr_mma.partition_B(gB_nk)
                 if const_expr(self.blockscaled):
                     # (MMA, MMA_M, MMA_K)
                     tCgSFA = thr_mma.partition_A(gSFA_mkl)
                     # (MMA, MMA_N, MMA_K)
                     tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
                 # TMA load B partition_S/D
-                copy_B, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_b,
-                    cta_coord=block_in_cluster_coord_vmnk[1],
-                    cta_layout=cute.make_layout(
-                        cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
-                    ),
-                    src_tensor=tCgB,
-                    dst_tensor=sB,
-                    mcast_mask=b_mcast_mask,
+                b_cta_layout = cute.make_layout(
+                    cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
                 )
+                copy_B, make_copy_B = None, None
+                if const_expr(varlen_manager.seg_B):
+                    # one copy fn per K segment; same TMA atom and SMEM target,
+                    # only the L (batch) coordinate differs
+                    def make_copy_B(b_batch: Int32) -> Callable:
+                        gB_nk_e = cute.local_tile(
+                            varlen_manager.offset_batch_B(mB_nkl, b_batch),
+                            cute.select(self.mma_tiler, [1, 2]),
+                            (mma_tile_coord_mnl[1], None),
+                        )
+                        fn, _, _ = copy_utils.tma_get_copy_fn(
+                            tma_atom_b,
+                            cta_coord=block_in_cluster_coord_vmnk[1],
+                            cta_layout=b_cta_layout,
+                            src_tensor=thr_mma.partition_B(gB_nk_e),
+                            dst_tensor=sB,
+                            mcast_mask=b_mcast_mask,
+                        )
+                        return fn
+                else:
+                    copy_B, _, _ = copy_utils.tma_get_copy_fn(
+                        tma_atom_b,
+                        cta_coord=block_in_cluster_coord_vmnk[1],
+                        cta_layout=b_cta_layout,
+                        src_tensor=tCgB,
+                        dst_tensor=sB,
+                        mcast_mask=b_mcast_mask,
+                    )
                 copy_SFA, copy_SFB = None, None
                 if const_expr(self.blockscaled):
                     #  TMA load SFA partition_S/D
@@ -1049,15 +1080,28 @@ class GemmSm100(GemmSm90):
                         mcast_mask=sfb_mcast_mask,
                     )
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
-                ab_producer_state = self.load_AB(
-                    ab_pipeline,
-                    ab_producer_state,
-                    copy_A,
-                    copy_B,
-                    k_tile_cnt,
-                    copy_SFA,
-                    copy_SFB,
-                )
+                if const_expr(varlen_manager.seg_B):
+                    # len_k = num_segs * B_K; the host checks B_K % tile_k == 0
+                    tiles_per_seg = cute.ceil_div(mB_nkl.shape[1], self.cta_tile_shape_mnk[2])
+                    ab_producer_state = self.load_AB_seg_B(
+                        ab_pipeline,
+                        ab_producer_state,
+                        copy_A,
+                        make_copy_B,
+                        varlen_manager.seg_batches(batch_idx),
+                        k_tile_cnt // tiles_per_seg,
+                        tiles_per_seg,
+                    )
+                else:
+                    ab_producer_state = self.load_AB(
+                        ab_pipeline,
+                        ab_producer_state,
+                        copy_A,
+                        copy_B,
+                        k_tile_cnt,
+                        copy_SFA,
+                        copy_SFB,
+                    )
                 if const_expr(epi_load_barrier is not None):
                     # In the first work tile, the epi load warp will wait for the signal
                     # from the mainloop load warp to start loading C, to avoid interfering

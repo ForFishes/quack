@@ -1032,6 +1032,47 @@ class GemmSm90:
         return ab_producer_state
 
     @cute.jit
+    def load_AB_seg_B(
+        self,
+        ab_pipeline: cutlass.pipeline.PipelineAsync,
+        ab_producer_state: cutlass.pipeline.PipelineState,
+        copy_A: Optional[Callable],
+        make_copy_B: Callable,
+        seg_batches: cute.Tensor,
+        num_segs: Int32,
+        tiles_per_seg: Int32,
+    ) -> cutlass.pipeline.PipelineState:
+        """``load_AB`` for a segmented B (``VarlenArguments.mBIdx``).
+
+        A's K axis is the concatenation of ``num_segs`` segments, each as long
+        as B's K extent. The K loop is split into ``num_segs`` x
+        ``tiles_per_seg``; at the start of segment ``seg`` a copy function for
+        B batch ``seg_batches[seg]`` is built. A's k-tile index runs over the
+        whole axis, B's restarts at 0 in every segment. Pipeline protocol and
+        stage count are those of ``load_AB``.
+        """
+        k_tile_cnt = num_segs * tiles_per_seg
+        peek_ab_empty_status = Boolean(True)
+        if 0 < k_tile_cnt:
+            peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+        for seg in cutlass.range(num_segs, unroll=1):
+            copy_B = make_copy_B(seg_batches[seg])
+            for t in cutlass.range(tiles_per_seg, unroll=1):
+                k_tile = seg * tiles_per_seg + t
+                ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
+                tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
+                smem_idx = ab_producer_state.index
+                if const_expr(copy_A is not None):
+                    copy_A(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+                copy_B(t, smem_idx, tma_bar_ptr=tma_bar_ptr)
+                ab_pipeline.producer_commit(ab_producer_state)
+                ab_producer_state.advance()
+                peek_ab_empty_status = Boolean(True)
+                if k_tile + 1 < k_tile_cnt:
+                    peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+        return ab_producer_state
+
+    @cute.jit
     def load_AB_gather_A(
         self,
         ab_pipeline: cutlass.pipeline.PipelineAsync,
